@@ -1,0 +1,102 @@
+generator client {
+    provider = "prisma-client-js"
+    binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x"]
+    output = "/home/ubuntu/bath_remodeling_funnel/app/node_modules/.prisma/client"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model User {
+  id                    String    @id @default(cuid())
+  name                  String?
+  email                 String    @unique
+  emailVerified         DateTime?
+  image                 String?
+  password              String?
+  role                  String    @default("admin")
+  googleAccessToken     String?   @db.Text
+  googleRefreshToken    String?   @db.Text
+  googleTokenExpiry     DateTime?
+  calendarId            String?   // Primary calendar ID
+  accounts              Account[]
+  sessions              Session[]
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Lead {
+  id                    String    @id @default(cuid())
+  firstName            String
+  lastName             String
+  email                String
+  cellPhone            String
+  address              String
+  ownOrRent            String    // "own" or "rent"
+  availableForConsult  Boolean
+  decisionMakersAvail  Boolean
+  renovateElsewhere    Boolean
+  renovateElsewhereDetails String?
+  status               String    @default("new") // "new", "qualified", "contacted", "converted", "rejected"
+  notes                String?
+  source               String?   @default("website") // "website", "gohighlevel", "odoo", "zapier", etc.
+  externalId           String?   // For CRM integration - stores ID from external CRM system
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  
+  // Relations
+  bookings             Booking[]
+}
+
+model Booking {
+  id          String    @id @default(cuid())
+  leadId      String
+  googleEventId String?
+  scheduledAt DateTime
+  duration    Int       @default(90) // minutes
+  status      String    @default("scheduled") // "scheduled", "completed", "cancelled", "rescheduled"
+  notes       String?
+  externalId  String?   // For CRM integration - stores ID from external CRM system
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  
+  // Relations
+  lead        Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+}

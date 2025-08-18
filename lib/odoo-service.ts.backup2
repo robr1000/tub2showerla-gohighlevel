@@ -1,0 +1,401 @@
+/**
+ * Odoo CRM Integration Service
+ * Creates leads in Odoo when customers book appointments
+ */
+
+export interface OdooLeadData {
+  name: string
+  email_from: string
+  phone: string
+  mobile: string
+  street: string
+  partner_name: string
+  description: string
+  stage_id?: number
+  source_id?: number
+}
+
+interface BookingDataForOdoo {
+  lead: {
+    id: string
+    firstName: string
+    lastName: string
+    email: string
+    cellPhone: string
+    address: string
+    ownOrRent: string
+    availableForConsult: boolean
+    decisionMakersAvail: boolean
+    renovateElsewhere: boolean
+    renovateElsewhereDetails?: string | null
+    createdAt: Date
+  }
+  booking: {
+    id: string
+    scheduledAt: Date
+    duration: number
+    notes?: string | null
+  }
+}
+
+class OdooService {
+  private credentials = {
+    url: process.env.ODOO_URL || '',
+    database: process.env.ODOO_DATABASE || '',
+    username: process.env.ODOO_USERNAME || '',
+    apiKey: process.env.ODOO_API_KEY || ''
+  }
+
+  /**
+   * Create XML-RPC request body
+   */
+  private createXmlRpcBody(method: string, params: any[]): string {
+    const paramsXml = params.map(param => {
+      if (typeof param === 'string') {
+        return `<param><value><string>${param}</string></value></param>`
+      } else if (typeof param === 'number') {
+        return `<param><value><int>${param}</int></value></param>`
+      } else if (typeof param === 'boolean') {
+        return `<param><value><boolean>${param ? '1' : '0'}</boolean></value></param>`
+      } else if (Array.isArray(param)) {
+        const arrayItems = param.map(item => {
+          if (Array.isArray(item)) {
+            const subItems = item.map(subItem => {
+              if (typeof subItem === 'string') {
+                return `<value><string>${subItem}</string></value>`
+              } else if (typeof subItem === 'number') {
+                return `<value><int>${subItem}</int></value>`
+              }
+              return `<value><string>${subItem}</string></value>`
+            }).join('')
+            return `<value><array><data>${subItems}</data></array></value>`
+          } else if (typeof item === 'string') {
+            return `<value><string>${item}</string></value>`
+          } else if (typeof item === 'number') {
+            return `<value><int>${item}</int></value>`
+          }
+          return `<value><string>${item}</string></value>`
+        }).join('')
+        return `<param><value><array><data>${arrayItems}</data></array></value></param>`
+      } else if (typeof param === 'object' && param !== null) {
+        const structItems = Object.entries(param).map(([key, value]) => {
+          let valueXml = ''
+          if (typeof value === 'string') {
+            valueXml = `<value><string>${value}</string></value>`
+          } else if (typeof value === 'number') {
+            valueXml = `<value><int>${value}</int></value>`
+          } else if (typeof value === 'boolean') {
+            valueXml = `<value><boolean>${value ? '1' : '0'}</boolean></value>`
+          } else {
+            valueXml = `<value><string>${value}</string></value>`
+          }
+          return `<member><name>${key}</name>${valueXml}</member>`
+        }).join('')
+        return `<param><value><struct>${structItems}</struct></value></param>`
+      }
+      return `<param><value><string>${param}</string></value></param>`
+    }).join('')
+
+    return `<?xml version="1.0"?>
+<methodCall>
+<methodName>${method}</methodName>
+<params>
+${paramsXml}
+
+    return new Promise((resolve, reject) => {
+      try {
+        console.log('🔐 Attempting Odoo XML-RPC authentication...')
+        console.log('Server URL:', this.credentials.url)
+        console.log('Database:', this.credentials.database)
+        console.log('Username:', this.credentials.username)
+        
+        const commonClient = this.createCommonClient()
+        
+        // Authenticate using XML-RPC
+        commonClient.methodCall('authenticate', [
+          this.credentials.database,
+          this.credentials.username,
+          this.credentials.apiKey,
+          {}
+        ], (error: any, value: any) => {
+          if (error) {
+            console.error('❌ XML-RPC authentication error:', error)
+            reject(new Error(`Authentication failed: ${error.message}`))
+            return
+          }
+          
+          if (!value || value === false) {
+            console.error('❌ Authentication failed: Invalid credentials')
+            reject(new Error('Authentication failed: Invalid credentials'))
+            return
+          }
+          
+          console.log('✅ Authentication successful, User ID:', value)
+          resolve(value)
+        })
+        
+      } catch (error) {
+        console.error('❌ Odoo authentication setup error:', error)
+        reject(error)
+      }
+    })
+  }
+
+  /**
+   * Get the "Qualified" stage ID from CRM pipeline using XML-RPC
+   */
+  private async getQualifiedStageId(uid: number): Promise<number | null> {
+    return new Promise((resolve, reject) => {
+      try {
+        console.log('🎯 Looking for "Qualified" stage using XML-RPC...')
+        
+        const objectClient = this.createObjectClient()
+        
+        // Search for CRM stages with name "Qualified"
+        objectClient.methodCall('execute_kw', [
+          this.credentials.database,
+          uid,
+          this.credentials.apiKey,
+          'crm.stage',
+          'search_read',
+          [[['name', '=', 'Qualified']]],
+          { fields: ['id', 'name'] }
+        ], (error: any, value: any) => {
+          if (error) {
+            console.error('❌ Error searching for Qualified stage:', error)
+            // Fallback to known stage ID 2 if search fails
+            console.log('⚠️  Using fallback Qualified stage ID: 2')
+            resolve(2)
+            return
+          }
+          
+          if (value && value.length > 0) {
+            const stageId = value[0].id
+            console.log('✅ Found Qualified stage ID:', stageId)
+            resolve(stageId)
+          } else {
+            console.log('⚠️  Qualified stage not found, using fallback ID: 2')
+            resolve(2)
+          }
+        })
+        
+      } catch (error) {
+        console.error('❌ Error getting qualified stage ID:', error)
+        // Fallback to known stage ID 2
+        console.log('⚠️  Using fallback Qualified stage ID: 2')
+        resolve(2)
+      }
+    })
+  }
+
+  /**
+   * Create lead in Odoo CRM using XML-RPC
+   */
+  private async createOdooLead(uid: number, leadData: OdooLeadData): Promise<number> {
+    return new Promise((resolve, reject) => {
+      try {
+        console.log('💾 Creating lead in Odoo using XML-RPC...')
+        console.log('Lead data preview:', {
+          name: leadData.name,
+          email: leadData.email_from,
+          phone: leadData.phone,
+          stage_id: leadData.stage_id
+        })
+        
+        const objectClient = this.createObjectClient()
+        
+        // Create the lead using XML-RPC
+        objectClient.methodCall('execute_kw', [
+          this.credentials.database,
+          uid,
+          this.credentials.apiKey,
+          'crm.lead',
+          'create',
+          [leadData]
+        ], (error: any, value: any) => {
+          if (error) {
+            console.error('❌ XML-RPC lead creation error:', error)
+            reject(new Error(`Lead creation failed: ${error.message}`))
+            return
+          }
+          
+          if (!value) {
+            console.error('❌ Lead creation failed: No ID returned')
+            reject(new Error('Lead creation failed: No ID returned'))
+            return
+          }
+          
+          console.log('✅ Lead created successfully in Odoo, ID:', value)
+          resolve(value)
+        })
+        
+      } catch (error) {
+        console.error('❌ Error creating Odoo lead:', error)
+        reject(error)
+      }
+    })
+  }
+
+  private mapBookingToOdooLead(bookingData: BookingDataForOdoo, stageId?: number): OdooLeadData {
+    const { lead, booking } = bookingData
+    
+    const appointmentDate = booking.scheduledAt.toLocaleDateString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    })
+    
+    const appointmentTime = booking.scheduledAt.toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZone: 'America/Los_Angeles'
+    })
+
+    let description = `WEBSITE BOOKING - Bath Remodeling Lead\n\n`
+    description += `SCHEDULED CONSULTATION:\n`
+    description += `Date: ${appointmentDate}\n`
+    description += `Time: ${appointmentTime} (PST)\n`
+    description += `Duration: ${booking.duration} minutes\n\n`
+    
+    description += `CUSTOMER DETAILS:\n`
+    description += `Name: ${lead.firstName} ${lead.lastName}\n`
+    description += `Email: ${lead.email}\n`
+    description += `Phone: ${lead.cellPhone}\n`
+    description += `Address: ${lead.address}\n`
+    description += `Homeowner: ${lead.ownOrRent === 'own' ? 'Yes' : 'No'}\n\n`
+    
+    description += `QUALIFICATION:\n`
+    description += `Available for consultation: ${lead.availableForConsult ? 'Yes' : 'No'}\n`
+    description += `Decision makers available: ${lead.decisionMakersAvail ? 'Yes' : 'No'}\n`
+    description += `Additional renovations: ${lead.renovateElsewhere ? 'Yes' : 'No'}\n`
+    
+    if (lead.renovateElsewhere && lead.renovateElsewhereDetails) {
+      description += `Additional details: ${lead.renovateElsewhereDetails}\n`
+    }
+    
+    if (booking.notes) {
+      description += `\nBOOKING NOTES: ${booking.notes}\n`
+    }
+    
+    description += `\nLEAD SOURCE: Website Booking\n`
+    description += `LEAD ID: ${lead.id}\n`
+    description += `Generated: ${new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`
+
+    const leadData: OdooLeadData = {
+      name: `${lead.firstName} ${lead.lastName} - Bath Remodeling`,
+      partner_name: `${lead.firstName} ${lead.lastName}`,
+      email_from: lead.email,
+      phone: lead.cellPhone,
+      mobile: lead.cellPhone,
+      street: lead.address,
+      description: description
+    }
+
+    // Add stage_id if we found the qualified stage
+    if (stageId) {
+      leadData.stage_id = stageId
+    }
+
+    return leadData
+  }
+
+  /**
+   * Test connection to Odoo
+   */
+  async testConnection(): Promise<{ success: boolean; userId?: number; error?: string }> {
+    try {
+      if (!this.credentials.url || !this.credentials.database || !this.credentials.username || !this.credentials.apiKey) {
+        throw new Error('Missing Odoo credentials')
+      }
+
+      console.log('🧪 Testing Odoo connection...')
+      console.log('URL:', this.credentials.url)
+      console.log('Database:', this.credentials.database)
+      console.log('Username:', this.credentials.username)
+      
+      const userId = await this.authenticate()
+      
+      console.log('✅ Odoo connection successful')
+      return { success: true, userId }
+      
+    } catch (error) {
+      console.error('❌ Odoo connection failed:', error)
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      }
+    }
+  }
+
+  /**
+   * Create lead from booking data
+   */
+  async createLeadFromBooking(bookingData: BookingDataForOdoo): Promise<{ success: boolean; leadId?: number; error?: string }> {
+    try {
+      console.log('📝 Creating Odoo lead from booking data...')
+      
+      if (!this.credentials.url || !this.credentials.database || !this.credentials.username || !this.credentials.apiKey) {
+        throw new Error('Missing Odoo credentials')
+      }
+
+      // Authenticate with Odoo
+      console.log('🔐 Authenticating with Odoo...')
+      const userId = await this.authenticate()
+
+      // Get the "Qualified" stage ID
+      console.log('🎯 Looking for "Qualified" stage...')
+      const qualifiedStageId = await this.getQualifiedStageId(userId)
+
+      // Map the data
+      const leadData = this.mapBookingToOdooLead(bookingData, qualifiedStageId || undefined)
+      console.log('📋 Mapped lead data:', {
+        name: leadData.name,
+        email: leadData.email_from,
+        phone: leadData.phone,
+        stage_id: leadData.stage_id || 'default'
+      })
+
+      // Create the lead
+      console.log('💾 Creating lead in Odoo...')
+      const leadId = await this.createOdooLead(userId, leadData)
+      
+      console.log('✅ Lead created successfully in Odoo')
+      console.log('Lead ID:', leadId)
+      console.log('Lead Name:', leadData.name)
+      
+      return {
+        success: true,
+        leadId: leadId
+      }
+      
+    } catch (error) {
+      console.error('❌ Failed to create Odoo lead:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      }
+    }
+  }
+
+  /**
+   * Direct lead creation (for testing)
+   */
+  async createLead(leadData: OdooLeadData): Promise<number> {
+    try {
+      console.log('📝 Creating direct lead:', leadData.name)
+      
+      const userId = await this.authenticate()
+      const leadId = await this.createOdooLead(userId, leadData)
+      
+      return leadId
+    } catch (error) {
+      console.error('❌ Failed to create direct lead:', error)
+      throw error
+    }
+  }
+}
+
+export const odooService = new OdooService()
+export type { BookingDataForOdoo }
